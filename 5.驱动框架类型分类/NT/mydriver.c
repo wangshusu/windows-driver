@@ -1,12 +1,12 @@
 #include <ntddk.h>
 
 typedef struct _DEVICE_EXTENSION {
-    UNICODE_STRING DeviceName;  // 存储设备名
+    UNICODE_STRING DeviceName;          // 存储设备名
     UNICODE_STRING SymbolicLinkName;    // 存储符号链接名
     ULONG DeviceData;
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
-PDEVICE_OBJECT deviceObject;
+PDEVICE_OBJECT deviceObject = NULL;
 
 NTSTATUS DeviceCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     // 处理设备创建和关闭请求
@@ -28,32 +28,6 @@ NTSTATUS DeviceIoControl(_In_ PDEVICE_OBJECT pDeviceObject, _In_ PIRP Irp) {
     return STATUS_SUCCESS;
 }
 
-VOID Dump(_In_ PDRIVER_OBJECT pDeviceObject) {
-    KdPrint(("-----------------------------------------------------------\n"));
-    KdPrint(("Begin Dump..........\n"));
-
-    // 打印调试信息
-    KdPrint(("Driver Address:%p\n", pDeviceObject));
-    KdPrint(("Driver Name   :%S\n", pDeviceObject->DriverName.Buffer));
-    KdPrint(("Driver Name   :%S\n", pDeviceObject->HardwareDatabase->Buffer));
-    KdPrint(("Driver First pDevice:%p\n", pDeviceObject->DeviceObject));
-
-    // 得到设备对象
-    int i = 1;
-    PDEVICE_OBJECT pDevice = pDeviceObject->DeviceObject;
-    for (; pDevice != NULL; pDevice = pDevice->NextDevice)
-    {
-        KdPrint(("Driver %d device\n", i++));
-        KdPrint(("Driver AttachedDevice:%p\n", pDevice->AttachedDevice));
-        KdPrint(("Driver NextDevice    :%p\n", pDevice->NextDevice));
-        KdPrint(("Driver StackSize     :%d\n", pDevice->StackSize));
-        KdPrint(("Driver DriverObject  :%p\n", pDevice->DriverObject));
-    }
-
-    KdPrint(("Begin Over..........\n"));
-    KdPrint(("-----------------------------------------------------------\n"));
-}
-
 VOID UnloadDriver(_In_ PDRIVER_OBJECT DriverObject) {
     // 执行清理和资源释放操作
 
@@ -71,9 +45,51 @@ VOID UnloadDriver(_In_ PDRIVER_OBJECT DriverObject) {
     }
 
     // 释放设备名称和符号链接名称内存
-    ExFreePool(deviceName.Buffer);
-    ExFreePool(symbolicLinkName.Buffer);
+    RtlFreeUnicodeString(&deviceName);
+    RtlFreeUnicodeString(&symbolicLinkName);
+    ExFreePool(deviceExtension);
 }
+
+VOID Dump(_In_ PDRIVER_OBJECT DriverObject) {
+    KdPrint(("-----------------------------------------------------------\n"));
+    KdPrint(("Begin Dump..........\n"));
+
+    // 打印驱动程序信息
+    KdPrint(("Driver Address:%p\n", DriverObject));
+    KdPrint(("Driver Name   :%S\n", DriverObject->DriverName.Buffer));
+
+    // 打印设备对象信息
+    int i = 1;
+    PDEVICE_OBJECT pDevice = DriverObject->DeviceObject;
+    for (; pDevice != NULL; pDevice = pDevice->NextDevice) {
+        KdPrint(("Device %d:\n", i++));
+        KdPrint(("    Device Address        : %p\n", pDevice));
+        KdPrint(("    AttachedDevice        : %p\n", pDevice->AttachedDevice));
+        KdPrint(("    NextDevice            : %p\n", pDevice->NextDevice));
+        KdPrint(("    StackSize             : %d\n", pDevice->StackSize));
+        KdPrint(("    DeviceExtension       : %p\n", pDevice->DeviceExtension));
+        // 打印其他设备对象信息...
+    }
+
+    KdPrint(("Begin Over..........\n"));
+    KdPrint(("-----------------------------------------------------------\n"));
+}
+
+
+NTSTATUS DeepCopyUnicodeString(PUNICODE_STRING dest, PCUNICODE_STRING src) {
+    dest->Length = src->Length;
+    dest->MaximumLength = src->Length + sizeof(WCHAR); // 加上null终止符的空间
+    dest->Buffer = (PWSTR)ExAllocatePoolWithTag(NonPagedPool, dest->MaximumLength, 'MyEx');
+    if (dest->Buffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(dest->Buffer, src->Buffer, src->Length);
+    dest->Buffer[src->Length / sizeof(WCHAR)] = L'\0'; // 添加null终止符
+
+    return STATUS_SUCCESS;
+}
+
 
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
     NTSTATUS status;
@@ -85,21 +101,37 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     }
 
     // 初始化设备名称
-    RtlInitUnicodeString(&deviceExtension->DeviceName, L"\\Device\\MyDevice");
-    RtlInitUnicodeString(&DriverObject->DriverName, L"\\Device\\MyDevice");
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\MyDevice");
+    status = DeepCopyUnicodeString(&deviceExtension->DeviceName, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        // 处理内存分配失败的情况
+        ExFreePool(deviceExtension);
+        return status;
+    }
 
     // 初始化符号链接名称
-    RtlInitUnicodeString(&deviceExtension->SymbolicLinkName, L"\\DosDevices\\MyDevice");
+    UNICODE_STRING symbolicLinkName;
+    RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\MyDevice");
+    status = DeepCopyUnicodeString(&deviceExtension->SymbolicLinkName, &symbolicLinkName);
+    if (!NT_SUCCESS(status)) {
+        // 处理内存分配失败的情况
+        RtlFreeUnicodeString(&deviceExtension->DeviceName);
+        ExFreePool(deviceExtension);
+        return status;
+    }
 
     // 创建设备对象
-    status = IoCreateDevice(DriverObject, 
-        sizeof(DEVICE_EXTENSION), 
-        NULL, 
-        FILE_DEVICE_UNKNOWN, 
-        FILE_DEVICE_SECURE_OPEN, 
-        FALSE, 
+    status = IoCreateDevice(DriverObject,
+        sizeof(DEVICE_EXTENSION),
+        &deviceName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
         &deviceObject);
     if (!NT_SUCCESS(status)) {
+        RtlFreeUnicodeString(&deviceExtension->SymbolicLinkName);
+        RtlFreeUnicodeString(&deviceExtension->DeviceName);
         ExFreePool(deviceExtension);
         return status;
     }
@@ -116,11 +148,18 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     DriverObject->DriverUnload = UnloadDriver;
 
     // 创建符号链接
-    status = IoCreateSymbolicLink(&deviceExtension->SymbolicLinkName, &deviceExtension->DeviceName);
+    status = IoCreateSymbolicLink(&symbolicLinkName, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(deviceObject);
+        RtlFreeUnicodeString(&deviceExtension->SymbolicLinkName);
+        RtlFreeUnicodeString(&deviceExtension->DeviceName);
+        ExFreePool(deviceExtension);
+        return status;
+    }
 
     // 其他初始化和处理逻辑
 
-    Dump(DriverObject)
+    Dump(DriverObject);
 
-    return status;
+    return STATUS_SUCCESS;
 }
